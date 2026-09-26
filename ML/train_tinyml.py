@@ -15,7 +15,7 @@ from sklearn.metrics import (
     confusion_matrix,
     f1_score,
 )
-from config import CLASSES, FEATURES, SEED
+from config import CLASSES, DATASET_SIZE, FEATURES, SEED
 
 # ============================================================
 # CONFIGURATION
@@ -38,6 +38,7 @@ SCALER_MEAN_PATH = MODEL_DIR / "scaler_mean.npy"
 SCALER_SCALE_PATH = MODEL_DIR / "scaler_scale.npy"
 
 LABELS_PATH = MODEL_DIR / "labels.json"
+ALERT_POLICY_PATH = MODEL_DIR / "alert_policy.json"
 
 
 # ============================================================
@@ -63,14 +64,26 @@ ID_TO_LABEL = {
 VALIDATION_SIZE = 0.20
 TEST_SIZE = 0.20
 
-EPOCHS = 25
+EPOCHS = 50
 BATCH_SIZE = 512
 SHUFFLE_BUFFER_SIZE = 50_000
 TFLITE_BATCH_SIZE = 1024
-L2_STRENGTH = 0.001
-DROPOUT_RATE = 0.15
+L2_STRENGTH = 0.0005
+DROPOUT_RATE = 0.20
 
 LEARNING_RATE = 0.001
+HIGH_ALERT_LABELS = ("ALCOHOL", "NARCOTIC")
+TARGET_ALERT_RECALL = 0.995
+
+
+def apply_alert_policy(probabilities, threshold):
+    predictions = np.argmax(probabilities, axis=1)
+    alert_indices = [LABEL_TO_ID[label] for label in HIGH_ALERT_LABELS]
+    alert_scores = probabilities[:, alert_indices].sum(axis=1)
+    force_alert = alert_scores >= threshold
+    strongest_alert = np.argmax(probabilities[:, alert_indices], axis=1)
+    predictions[force_alert] = np.asarray(alert_indices)[strongest_alert[force_alert]]
+    return predictions
 
 
 def make_dataset(features, labels, training=False):
@@ -137,6 +150,19 @@ unknown_labels = set(df["label"].unique()) - set(LABELS)
 if unknown_labels:
     raise ValueError(
         f"Unknown labels found: {unknown_labels}"
+    )
+
+if len(df) != DATASET_SIZE:
+    raise ValueError(
+        f"Expected {DATASET_SIZE} dataset rows, found {len(df)}."
+    )
+
+class_counts = df["label"].value_counts()
+expected_class_count = DATASET_SIZE // len(CLASSES)
+if any(class_counts.get(label, 0) != expected_class_count for label in CLASSES):
+    raise ValueError(
+        f"Dataset must contain {expected_class_count} rows per class: "
+        f"{class_counts.to_dict()}"
     )
 
 
@@ -244,13 +270,22 @@ model = tf.keras.Sequential([
     ),
 
     tf.keras.layers.Dense(
-        8,
+        32,
         activation="relu",
         kernel_regularizer=tf.keras.regularizers.l2(L2_STRENGTH),
-        name="dense_8",
+        name="dense_32",
     ),
 
-    tf.keras.layers.Dropout(DROPOUT_RATE, name="dropout"),
+    tf.keras.layers.Dropout(DROPOUT_RATE, name="dropout_1"),
+
+    tf.keras.layers.Dense(
+        16,
+        activation="relu",
+        kernel_regularizer=tf.keras.regularizers.l2(L2_STRENGTH),
+        name="dense_16",
+    ),
+
+    tf.keras.layers.Dropout(DROPOUT_RATE / 2, name="dropout_2"),
 
     tf.keras.layers.Dense(
         len(LABELS),
@@ -283,8 +318,8 @@ validation_dataset = make_dataset(X_val_scaled, y_val)
 
 early_stopping = tf.keras.callbacks.EarlyStopping(
     monitor="val_loss",
-    patience=4,
-    min_delta=0.001,
+    patience=6,
+    min_delta=0.0005,
     restore_best_weights=True,
 )
 
@@ -305,6 +340,57 @@ history = model.fit(
     shuffle=False,
     verbose=1,
 )
+
+validation_probabilities = model.predict(
+    X_val_scaled,
+    batch_size=BATCH_SIZE,
+    verbose=0,
+)
+alert_indices = [LABEL_TO_ID[label] for label in HIGH_ALERT_LABELS]
+validation_alert_scores = validation_probabilities[:, alert_indices].sum(axis=1)
+validation_alert_mask = np.isin(
+    y_val,
+    alert_indices,
+)
+validation_base_predictions = np.argmax(validation_probabilities, axis=1)
+validation_base_alert = np.isin(validation_base_predictions, alert_indices)
+missable_alert_scores = np.sort(
+    validation_alert_scores[validation_alert_mask & ~validation_base_alert]
+)
+allowed_misses = int(
+    np.floor((1.0 - TARGET_ALERT_RECALL) * np.sum(validation_alert_mask))
+)
+if len(missable_alert_scores) > allowed_misses:
+    alert_threshold = float(missable_alert_scores[allowed_misses])
+else:
+    alert_threshold = float(validation_alert_scores.max()) + 1e-7
+
+validation_policy_predictions = apply_alert_policy(
+    validation_probabilities,
+    alert_threshold,
+)
+validation_policy_alert = np.isin(validation_policy_predictions, alert_indices)
+validation_alert_recall = float(
+    np.mean(validation_policy_alert[validation_alert_mask])
+)
+validation_false_alert_rate = float(
+    np.mean(validation_policy_alert[~validation_alert_mask])
+)
+
+with open(ALERT_POLICY_PATH, "w", encoding="utf-8") as f:
+    json.dump({
+        "high_alert_labels": list(HIGH_ALERT_LABELS),
+        "threshold": alert_threshold,
+        "target_validation_recall": TARGET_ALERT_RECALL,
+        "validation_recall": validation_alert_recall,
+        "validation_false_alert_rate": validation_false_alert_rate,
+        "calibration": "highest threshold meeting target validation recall",
+    }, f, indent=2)
+
+print()
+print(f"High-alert threshold saved: {alert_threshold:.6f}")
+print(f"Validation high-alert recall : {validation_alert_recall:.4f}")
+print(f"Validation false-alert rate : {validation_false_alert_rate:.4f}")
 
 
 # ============================================================
@@ -332,9 +418,9 @@ test_probabilities = model.predict(
     verbose=0,
 )
 
-y_pred = np.argmax(
+y_pred = apply_alert_policy(
     test_probabilities,
-    axis=1,
+    alert_threshold,
 )
 
 train_probabilities = model.predict(
@@ -343,7 +429,10 @@ train_probabilities = model.predict(
     verbose=0,
 )
 
-y_train_pred = np.argmax(train_probabilities, axis=1)
+y_train_pred = apply_alert_policy(
+    train_probabilities,
+    alert_threshold,
+)
 train_accuracy = accuracy_score(y_train, y_train_pred)
 train_macro_f1 = f1_score(y_train, y_train_pred, average="macro")
 
@@ -364,6 +453,18 @@ print(f"Macro F1 : {macro_f1:.4f}")
 print(f"Train accuracy : {train_accuracy:.4f}")
 print(f"Train Macro F1 : {train_macro_f1:.4f}")
 print(f"Train-test accuracy gap : {train_accuracy - accuracy:+.4f}")
+
+test_alert_mask = np.isin(y_test, alert_indices)
+test_alert_predictions = np.isin(y_pred, alert_indices)
+alert_false_negatives = int(np.sum(test_alert_mask & ~test_alert_predictions))
+test_alert_recall = 1.0 - alert_false_negatives / int(np.sum(test_alert_mask))
+non_alert_mask = ~test_alert_mask
+alert_false_positive_rate = float(
+    np.mean(test_alert_predictions[non_alert_mask])
+)
+print(f"Held-out high-alert false negatives : {alert_false_negatives}")
+print(f"Held-out high-alert recall : {test_alert_recall:.4f}")
+print(f"Held-out non-alert false-positive rate : {alert_false_positive_rate:.4f}")
 
 print()
 print("Classification report:")
@@ -553,7 +654,7 @@ print(
 print()
 print("Evaluating INT8 model...")
 
-int8_predictions = []
+int8_probabilities = []
 
 if input_scale == 0:
     raise ValueError("Invalid INT8 input scale.")
@@ -585,11 +686,13 @@ for start in range(0, len(X_test_scaled), TFLITE_BATCH_SIZE):
     if output_scale != 0:
         output = (output.astype(np.float32) - output_zero_point) * output_scale
 
-    int8_predictions.extend(np.argmax(output, axis=1).tolist())
+    int8_probabilities.extend(output.tolist())
 
 
-int8_predictions = np.array(
-    int8_predictions
+int8_probabilities = np.asarray(int8_probabilities, dtype=np.float32)
+int8_predictions = apply_alert_policy(
+    int8_probabilities,
+    alert_threshold,
 )
 
 
@@ -618,6 +721,12 @@ print(
     f"INT8 Macro F1 : "
     f"{int8_macro_f1:.4f}"
 )
+
+int8_alert_predictions = np.isin(int8_predictions, alert_indices)
+int8_false_negatives = int(np.sum(test_alert_mask & ~int8_alert_predictions))
+int8_alert_recall = 1.0 - int8_false_negatives / int(np.sum(test_alert_mask))
+print(f"INT8 held-out high-alert false negatives : {int8_false_negatives}")
+print(f"INT8 held-out high-alert recall : {int8_alert_recall:.4f}")
 
 print()
 print("INT8 classification report:")
@@ -686,4 +795,5 @@ print(f"  TFLite: {TFLITE_MODEL_PATH}")
 print(f"  Mean  : {SCALER_MEAN_PATH}")
 print(f"  Scale : {SCALER_SCALE_PATH}")
 print(f"  Labels: {LABELS_PATH}")
+print(f"  Alert policy: {ALERT_POLICY_PATH}")
 

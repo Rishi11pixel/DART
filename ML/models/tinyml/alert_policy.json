@@ -1,0 +1,11 @@
+{
+  "high_alert_labels": [
+    "ALCOHOL",
+    "NARCOTIC"
+  ],
+  "threshold": 0.038541279733181,
+  "target_validation_recall": 0.995,
+  "validation_recall": 0.995,
+  "validation_false_alert_rate": 0.18510416666666665,
+  "calibration": "highest threshold meeting target validation recall"
+}
